@@ -1,0 +1,20 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "regions": ["pdx1"],
+  "services": {
+    "web": {
+      "root": "web",
+      "framework": "vite",
+      "buildCommand": "VITE_BLOB_UPLOADS=1 npm run build"
+    },
+    "api": {
+      "root": "server",
+      "framework": "fastapi",
+      "buildCommand": "rm -rf assets && mkdir assets && cp -R ../assets/songs ../assets/moves assets/"
+    }
+  },
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": { "service": "api" } },
+    { "source": "/(.*)", "destination": { "service": "web" } }
+  ]
+}

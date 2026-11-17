@@ -1,0 +1,279 @@
+"""Stage 1: song analysis (beats, downbeats, sections) for uploads and library songs, cached on disk."""
+
+from __future__ import annotations
+
+import contextlib
+import time
+import urllib.error
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Annotated, Any, Literal
+from urllib.parse import quote
+
+import anyio
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi import Path as PathParam
+from fastapi.responses import FileResponse, RedirectResponse
+from pydantic import BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
+from vercel.blob import BlobNotFoundError
+
+from app import blob
+from app.accounts.store import spend
+from app.analysis import ID_PATTERN, Analysis
+from app.analysis_store import AnalysisStore, audio_extension, sha256_bytes, sha256_file
+from app.api.deps import bad_audio_is_400, hash_upload, read_upload, song_path, upload_display_name
+from app.api.limits import ANALYSIS_SLOTS, UploadTooLarge, client_ip
+from app.audio import load_audio
+from app.audio.analysis import ANALYSIS_VERSION, analyze_audio
+from app.config import Settings, get_settings
+from app.library import MEDIA_TYPES, song_artist, song_title
+from app.vultr_worker import forward_analysis, worker_url
+
+router = APIRouter(tags=["analysis"])
+SettingsDep = Annotated[Settings, Depends(get_settings)]
+AnalysisId = Annotated[str, PathParam(pattern=ID_PATTERN, description="sha256 hex of the audio bytes")]
+Refresh = Annotated[bool, Query(description="Recompute even if a cached analysis exists")]
+ANALYSIS_RESPONSE: dict[str, Any] = {"response_model": Analysis, "response_model_exclude_none": True}
+
+
+@router.post("/analyze", **ANALYSIS_RESPONSE)
+async def analyze_upload(
+    settings: SettingsDep,
+    file: Annotated[UploadFile, File()],
+    title: Annotated[str | None, Form()] = None,
+    refresh: Refresh = False,
+) -> Analysis:
+    """Analyze an uploaded song; the audio is kept by content hash for GET /api/audio/{id}."""
+    digest, _ = await hash_upload(file, settings.max_upload_bytes)  # streamed; nothing held in RAM yet
+    name = upload_display_name(file.filename)
+    meta = _upload_meta(digest, name, title)
+    store = AnalysisStore(settings.cache_dir)
+    async with _one_at_a_time(digest):
+        if not refresh:
+            cached = await _load_cached(store, digest, meta)
+            if cached is not None:
+                if not await run_in_threadpool(store.has_audio, digest):  # cached from a library copy
+                    data = await read_upload(file, settings.max_upload_bytes)
+                    await run_in_threadpool(store.save_audio, digest, data, audio_extension(name, data))
+                return cached
+        async with ANALYSIS_SLOTS:  # read inside the slot: queued uploads stay spooled on disk, not in RAM
+            data = await read_upload(file, settings.max_upload_bytes)
+            return await run_in_threadpool(
+                analyze_and_store, store, digest, data, meta, file.filename, settings.max_duration_sec
+            )
+
+
+class BlobTokenPayload(BaseModel):
+    pathname: str = Field(max_length=blob.MAX_UPLOAD_PATHNAME)
+
+
+class BlobTokenRequest(BaseModel):
+    """The event @vercel/blob's client ``upload()`` POSTs to its ``handleUploadUrl``."""
+
+    type: Literal["blob.generate-client-token"]
+    payload: BlobTokenPayload
+
+
+class BlobUpload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(max_length=2048, description="Blob URL returned by the browser's upload()")
+    filename: str | None = Field(default=None, max_length=1024)
+    title: str | None = Field(default=None, max_length=300)
+
+
+def _require_blob() -> None:
+    if not blob.enabled():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Blob uploads are not enabled on this server.")
+
+
+# Upload tokens per client IP per hour, all instances (a venue NAT shares one IP): the store is public, so
+# without it anyone could use it as free file hosting.
+BLOB_UPLOADS_PER_HOUR = 60
+
+
+@router.post("/blob/upload")
+def blob_upload_token(req: BlobTokenRequest, request: Request, settings: SettingsDep) -> dict[str, str]:
+    """Deployments: a short-lived token for uploading one song from the browser straight to Blob."""
+    _require_blob()
+    if not spend(f"blob-upload:{client_ip(request)}", (BLOB_UPLOADS_PER_HOUR, 3_600_000), int(time.time() * 1000)):
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Too many uploads this hour; try again later.")
+    try:
+        token = blob.client_token(req.payload.pathname, settings.max_upload_bytes)
+    except blob.NotOurUpload as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    return {"type": req.type, "clientToken": token}
+
+
+@router.post("/analyze/blob", **ANALYSIS_RESPONSE)
+async def analyze_blob_upload(req: BlobUpload, settings: SettingsDep, refresh: Refresh = False) -> Analysis:
+    """Deployments: like POST /api/analyze, for a song the browser uploaded to Blob (bodies cap at 4.5 MB).
+
+    The upload is deleted afterwards; its audio is kept by content hash like any upload.
+    """
+    _require_blob()
+    try:
+        url = blob.upload_url(req.url)
+    except blob.NotOurUpload as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    if worker := worker_url():  # the always-warm Vultr worker (app.vultr_worker); off unless configured
+        try:
+            doc = await run_in_threadpool(forward_analysis, worker, req.model_dump(), refresh)
+        except urllib.error.HTTPError as exc:
+            raise HTTPException(exc.code, f"Analysis worker: {exc.reason}") from exc
+        except OSError as exc:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "The analysis worker is unreachable.") from exc
+        return Analysis.model_validate(doc)
+    try:  # from here on the upload is always deleted, whatever happens
+        try:
+            if await run_in_threadpool(blob.upload_size, url) > settings.max_upload_bytes:
+                raise UploadTooLarge(settings.max_upload_bytes)
+            data = await run_in_threadpool(blob.read_upload, url)
+        except BlobNotFoundError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "That upload is not in Blob storage.") from exc
+        if not data:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Uploaded file is empty.")
+        digest = sha256_bytes(data)
+        name = upload_display_name(req.filename)
+        meta = _upload_meta(digest, name, req.title)
+        store = AnalysisStore(settings.cache_dir)
+        async with _one_at_a_time(digest):
+            if not refresh:
+                cached = await _load_cached(store, digest, meta)
+                if cached is not None:
+                    if not await run_in_threadpool(store.has_audio, digest):
+                        await run_in_threadpool(store.save_audio, digest, data, audio_extension(name, data))
+                    return cached
+            async with ANALYSIS_SLOTS:
+                return await run_in_threadpool(
+                    analyze_and_store, store, digest, data, meta, name, settings.max_duration_sec
+                )
+    finally:
+        with contextlib.suppress(BlobNotFoundError):  # already gone is fine
+            await run_in_threadpool(blob.delete_upload, url)
+
+
+@router.get("/songs/{file}/analysis", **ANALYSIS_RESPONSE)
+async def analyze_library_song(file: str, settings: SettingsDep, refresh: Refresh = False) -> Analysis:
+    """Analyze a song in assets/songs/ (title and artist from its sidecar)."""
+    path = song_path(settings.songs_dir, file)
+    digest = await run_in_threadpool(sha256_file, path)
+    meta = library_meta(file, path)
+    store = AnalysisStore(settings.cache_dir)
+    async with _one_at_a_time(digest):
+        if not refresh:
+            cached = await _load_cached(store, digest, meta)
+            if cached is not None:
+                return cached
+        async with ANALYSIS_SLOTS:
+            return await run_in_threadpool(
+                analyze_and_store, store, digest, path, meta, file, settings.max_duration_sec
+            )
+
+
+@router.get("/analysis/{id}", **ANALYSIS_RESPONSE)
+async def get_analysis(id: AnalysisId, settings: SettingsDep) -> Analysis:
+    """A previously computed analysis (404 if this audio was never analyzed)."""
+    cached = await _load_cached(AnalysisStore(settings.cache_dir), id, {})
+    if cached is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No analysis with this id; analyze the song first.")
+    return cached
+
+
+@router.get("/audio/{id}", response_class=FileResponse, response_model=None)
+def get_uploaded_audio(id: AnalysisId, settings: SettingsDep) -> FileResponse | RedirectResponse:
+    """An uploaded song's audio by content hash (supports Range requests); on deployments, a redirect to Blob."""
+    store = AnalysisStore(settings.cache_dir)
+    path = store.audio_path(id)
+    if path is not None:
+        return FileResponse(path, media_type=MEDIA_TYPES.get(path.suffix, "application/octet-stream"))
+    url = store.audio_url(id)
+    if url is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No uploaded audio with this id.")
+    return RedirectResponse(url, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+
+
+def _upload_meta(digest: str, name: str, title: str | None) -> dict[str, Any]:
+    """Request-specific fields of an uploaded song's analysis."""
+    return {
+        "title": (title or "").strip() or Path(name).stem or name,
+        "artist": None,
+        "source": {"kind": "upload", "file": name},
+        "audioUrl": f"/api/audio/{digest}",
+    }
+
+
+async def _load_cached(store: AnalysisStore, digest: str, meta: dict[str, Any]) -> Analysis | None:
+    """The cached analysis with this request's title/source/audioUrl, or None (missing/stale/invalid)."""
+    start = time.perf_counter()
+    doc = await run_in_threadpool(store.load, digest)
+    if doc is None:
+        return None
+    try:
+        doc.update(meta, cached=True, elapsedMs=round((time.perf_counter() - start) * 1000, 1))
+        return Analysis.model_validate(doc)
+    except ValueError:  # pydantic.ValidationError: e.g. written by an older, incompatible build
+        return None
+
+
+def library_meta(file: str, path: Path) -> dict[str, Any]:
+    """Request-specific fields of a library song's analysis (title/artist from its sidecar)."""
+    return {
+        "title": song_title(path),
+        "artist": song_artist(path),
+        "source": {"kind": "library", "file": file},
+        "audioUrl": f"/api/songs/{quote(file, safe='')}",
+    }
+
+
+def analyze_and_store(
+    store: AnalysisStore,
+    digest: str,
+    source: Path | bytes,
+    meta: dict[str, Any],
+    filename_hint: str | None,
+    max_duration_sec: float,
+) -> Analysis:
+    """Decode + analyze (blocking; runs in a worker thread), then cache. Bad audio is a 400."""
+    start = time.perf_counter()
+    with bad_audio_is_400():
+        y, sr = load_audio(source, filename_hint=filename_hint, max_duration_sec=max_duration_sec)
+        fields = analyze_audio(y, sr)
+    analysis = Analysis.model_validate(
+        {
+            "id": digest,
+            "analysisVersion": ANALYSIS_VERSION,
+            **meta,
+            **fields,
+            "elapsedMs": round((time.perf_counter() - start) * 1000, 1),
+            "cached": False,
+        }
+    )
+    if isinstance(source, bytes):
+        store.save_audio(digest, source, audio_extension(filename_hint, source))
+    store.save(digest, analysis.to_json_dict())
+    return analysis
+
+
+# One analysis per audio file at a time: a second request for the same bytes waits, then reads
+# the cache instead of analyzing again. (Event-loop only, so a plain dict is safe.)
+_inflight: dict[str, tuple[anyio.Lock, int]] = {}
+
+
+@asynccontextmanager
+async def _one_at_a_time(digest: str) -> AsyncIterator[None]:
+    lock, users = _inflight.get(digest, (None, 0))
+    if lock is None:
+        lock = anyio.Lock()
+    _inflight[digest] = (lock, users + 1)
+    try:
+        async with lock:
+            yield
+    finally:
+        lock, users = _inflight[digest]
+        if users <= 1:
+            del _inflight[digest]
+        else:
+            _inflight[digest] = (lock, users - 1)
